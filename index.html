@@ -1,0 +1,1152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no, maximum-scale=1">
+<meta name="format-detection" content="telephone=no">
+<title>Catch the drop</title>
+<!--
+  M002 — "Catch the drop"
+  Single-file HTML5 playable ad. Spec build, unaffiliated with Vinted.
+  Brand name and palette are referenced for portfolio demonstration only.
+
+  BUILD STEP 2 of 6: core catch loop.
+  Present: config, SDK wrapper, state machine, stage scaling, safe areas,
+           reduced-motion; falling items, draggable basket, collision, score.
+  Absent:  rival buyer + hot items (step 3), real drawn art and particles
+           (step 4), tutorial hand / haul render / deep link (step 5).
+-->
+<style>
+/* ---------------------------------------------------------------------------
+   Everything inline. No external requests of any kind at runtime.
+   Colours are injected from CONFIG.palette at boot so the skin lives in one
+   place; the values below are only fallbacks for a no-JS render.
+--------------------------------------------------------------------------- */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --teal: #09B1BA;
+  --teal-deep: #06767C;
+  --ink: #16110E;
+  --canvas: #F6F2EC;
+  --hot: #E8564F;
+  --accent: #F5C451;
+
+  /* Stage geometry, written by JS on resize. */
+  --stage-w: 100vw;
+  --stage-h: 100vh;
+
+  /* Nothing important within 60px of an edge, and never inside a notch. */
+  --safe-t: max(60px, env(safe-area-inset-top));
+  --safe-r: max(60px, env(safe-area-inset-right));
+  --safe-b: max(60px, env(safe-area-inset-bottom));
+  --safe-l: max(60px, env(safe-area-inset-left));
+
+  --ui: ui-rounded, "SF Pro Rounded", -apple-system, BlinkMacSystemFont,
+        "Segoe UI", Roboto, system-ui, sans-serif;
+  --xfade: 260ms;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: #000;                 /* letterbox surround */
+  font-family: var(--ui);
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none; user-select: none;
+  touch-action: none;               /* we own every gesture */
+  overscroll-behavior: none;
+}
+
+/* --- Stage -----------------------------------------------------------------
+   Fixed 9:16 logical stage, centred and letterboxed. Portrait fills the
+   viewport; landscape pillarboxes rather than reflowing, which keeps one
+   coordinate system for the game and guarantees landscape can't break.
+--------------------------------------------------------------------------- */
+#stage {
+  position: fixed;
+  left: 50%; top: 50%;
+  transform: translate(-50%, -50%);
+  width: var(--stage-w);
+  height: var(--stage-h);
+  overflow: hidden;
+  background: var(--canvas);
+}
+
+#game { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+/* --- Screens --------------------------------------------------------------- */
+.screen {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  padding: var(--safe-t) var(--safe-r) var(--safe-b) var(--safe-l);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity var(--xfade) ease;
+}
+.screen.is-active { opacity: 1; visibility: visible; }
+
+/* START ---------------------------------------------------------------------- */
+#screen-start {
+  justify-content: center; align-items: center; text-align: center;
+  /* Dimmed veil: the mechanic plays underneath from step 2 onward. */
+  background:
+    radial-gradient(120% 80% at 50% 30%, rgba(9,177,186,.36), transparent 70%),
+    rgba(11, 26, 28, .74);
+  color: #fff;
+}
+#screen-start h1 {
+  font-size: clamp(30px, 9.5vw, 52px);
+  line-height: 1.04; letter-spacing: -.025em; font-weight: 800;
+  max-width: 12ch;
+}
+#screen-start p {
+  margin-top: 14px;
+  font-size: clamp(15px, 4.2vw, 20px);
+  line-height: 1.35; font-weight: 500;
+  color: rgba(255,255,255,.86);
+  max-width: 22ch;
+}
+.tap-hint {
+  margin-top: 40px;
+  display: inline-flex; align-items: center; gap: 10px;
+  font-size: 14px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  color: rgba(255,255,255,.9);
+}
+.tap-hint .dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #fff;
+  animation: ping 1.5s ease-out infinite;
+}
+@keyframes ping {
+  0%   { transform: scale(.7); opacity: .45; }
+  60%  { transform: scale(1.35); opacity: 1; }
+  100% { transform: scale(.7); opacity: .45; }
+}
+
+/* PLAY ----------------------------------------------------------------------
+   HUD only. It must never eat the drag, so the layer is click-through and
+   only the CTA chip opts back in.
+--------------------------------------------------------------------------- */
+#screen-play { pointer-events: none; background: transparent; }
+.hud-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+
+.timer {
+  width: 116px; height: 8px; border-radius: 99px;
+  background: rgba(22,17,14,.14); overflow: hidden;
+}
+.timer > i {
+  display: block; height: 100%; width: 100%;
+  transform-origin: left center;
+  background: var(--teal);
+  border-radius: 99px;
+}
+
+.score { margin-top: 10px; font-weight: 800; color: var(--ink); }
+.score b {
+  font-size: 34px; letter-spacing: -.03em;
+  display: inline-block; font-variant-numeric: tabular-nums;
+}
+.score b.bump { animation: bump 260ms cubic-bezier(.2,.9,.3,1) 1; }
+@keyframes bump {
+  0%   { transform: scale(1); }
+  30%  { transform: scale(1.22); }
+  100% { transform: scale(1); }
+}
+
+/* Goal bar: the run completes when this fills. */
+.goal {
+  margin-top: 6px; width: 116px; height: 6px; border-radius: 99px;
+  background: rgba(22,17,14,.12); overflow: hidden;
+}
+.goal > i {
+  display: block; height: 100%; width: 100%;
+  transform: scaleX(0); transform-origin: left center;
+  background: var(--accent); border-radius: 99px;
+}
+.goal-label {
+  margin-top: 5px; font-size: 12px; font-weight: 700;
+  color: var(--ink); opacity: .5; font-variant-numeric: tabular-nums;
+}
+
+/* Persistent CTA affordance, present for the whole of PLAY. */
+.cta-chip {
+  pointer-events: auto;
+  border: 0; cursor: pointer;
+  font-family: inherit; font-size: 13px; font-weight: 800; letter-spacing: .01em;
+  color: #fff; background: var(--teal);
+  padding: 10px 16px; border-radius: 99px;
+  box-shadow: 0 2px 0 var(--teal-deep), 0 6px 16px rgba(6,118,124,.28);
+}
+.cta-chip:active { transform: translateY(1px); box-shadow: 0 1px 0 var(--teal-deep); }
+
+/* END ------------------------------------------------------------------------ */
+#screen-end {
+  justify-content: center; align-items: center; text-align: center;
+  background:
+    radial-gradient(110% 70% at 50% 18%, rgba(9,177,186,.30), transparent 68%),
+    var(--ink);
+  color: #fff;
+  cursor: pointer;                  /* whole card is the CTA */
+}
+.wordmark {
+  font-size: clamp(28px, 8vw, 40px);
+  font-weight: 800; letter-spacing: -.035em;
+  color: var(--teal);
+}
+/* Step 5 replaces this with drawn SVG letterforms. */
+.wordmark[data-placeholder]::after {
+  content: ""; display: block; height: 3px; width: 40%;
+  margin: 8px auto 0; border-radius: 99px; background: var(--teal); opacity: .5;
+}
+#screen-end .haul-slot {
+  margin: 26px 0 22px;
+  width: min(300px, 78%); min-height: 128px;
+  border-radius: 20px;
+  border: 1px dashed rgba(255,255,255,.22);
+  display: grid; place-items: center;
+  font-size: 13px; font-weight: 600; color: rgba(255,255,255,.42);
+}
+#screen-end p {
+  font-size: clamp(15px, 4.2vw, 19px); line-height: 1.35; font-weight: 500;
+  color: rgba(255,255,255,.82); max-width: 24ch;
+}
+.cta-primary {
+  margin-top: 26px;
+  pointer-events: auto; border: 0; cursor: pointer;
+  font-family: inherit; font-size: 18px; font-weight: 800;
+  color: #fff; background: var(--teal);
+  padding: 17px 46px; border-radius: 99px;
+  box-shadow: 0 3px 0 var(--teal-deep), 0 10px 26px rgba(6,118,124,.34);
+}
+.cta-primary:active { transform: translateY(2px); box-shadow: 0 1px 0 var(--teal-deep); }
+.cta-primary.pulse { animation: pulse 900ms ease-out 1; }
+@keyframes pulse {
+  0%   { transform: scale(1); }
+  35%  { transform: scale(1.07); }
+  70%  { transform: scale(.985); }
+  100% { transform: scale(1); }
+}
+.legal {
+  margin-top: 18px; font-size: 11px; font-weight: 500;
+  color: rgba(255,255,255,.34); max-width: 30ch;
+}
+
+/* Review-build only; CONFIG.debug turns it off. */
+#debug {
+  position: absolute; left: 0; right: 0; bottom: 6px;
+  text-align: center; font-size: 10px; font-weight: 600;
+  color: rgba(127,127,127,.65); pointer-events: none; z-index: 9;
+}
+
+/* --- Reduced motion --------------------------------------------------------
+   Decoration stops; the game stays fully playable.
+--------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  .screen { transition-duration: 1ms; }
+  .tap-hint .dot, .cta-primary.pulse, .score b.bump { animation: none; }
+}
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="game"></canvas>
+
+  <section id="screen-start" class="screen" aria-hidden="true">
+    <h1 data-copy="startHeadline"></h1>
+    <p data-copy="startSub"></p>
+    <div class="tap-hint"><span class="dot"></span><span data-copy="startHint"></span></div>
+  </section>
+
+  <section id="screen-play" class="screen" aria-hidden="true">
+    <div class="hud-top">
+      <div>
+        <div class="timer"><i id="timer-fill"></i></div>
+        <div class="score"><b id="score-value">0</b></div>
+        <div class="goal"><i id="goal-fill"></i></div>
+        <div class="goal-label"><span data-copy="goalPrefix"></span> <b id="goal-target">0</b></div>
+      </div>
+      <button class="cta-chip" id="cta-chip" type="button" data-copy="ctaShort"></button>
+    </div>
+  </section>
+
+  <section id="screen-end" class="screen" aria-hidden="true">
+    <div class="wordmark" data-placeholder data-copy="brandName"></div>
+    <div class="haul-slot" id="haul-slot">your haul renders here (step 5)</div>
+    <p data-copy="endSub"></p>
+    <button class="cta-primary" id="cta-primary" type="button" data-copy="ctaLabel"></button>
+    <div class="legal" data-copy="legal"></div>
+  </section>
+
+  <div id="debug"></div>
+</div>
+
+<script>
+"use strict";
+/* ===========================================================================
+   1. CONFIG — the whole skin lives here.
+   Re-brand by editing this object only. No game logic reads a literal colour,
+   string, shape or duration from anywhere else in the file.
+   =========================================================================== */
+const CONFIG = {
+  debug: true,                       // set false to ship
+
+  brand: {
+    name: "Vinted",
+    // Spec/portfolio build. Not affiliated with or endorsed by the brand.
+    spec: true
+  },
+
+  // 6 named values. Injected into CSS custom properties and used by canvas.
+  palette: {
+    teal:     "#09B1BA",             // primary / basket / CTA
+    tealDeep: "#06767C",             // pressed + shadow
+    ink:      "#16110E",             // text + end card ground
+    canvas:   "#F6F2EC",             // play field
+    hot:      "#E8564F",             // hot item + rival
+    accent:   "#F5C451"              // catch sparks + highlights
+  },
+
+  copy: {
+    brandName:     "Vinted",
+    startHeadline: "Catch the drop",
+    startSub:      "Secondhand finds, before someone else gets them.",
+    startHint:     "Drag to play",
+    haulLabel:     "in basket",
+    goalPrefix:    "of",
+    ctaShort:      "Get the app",
+    endSub:        "Thousands of secondhand pieces listed every day. Find yours first.",
+    ctaLabel:      "Install",
+    legal:         "Spec creative. Not affiliated with the brand shown."
+  },
+
+  /* Categories. `path` is filled in at step 4 (drawn SVG path data, 100x100
+     viewbox). `label` is what a caught item's tag shows — no prices, no
+     discounts, no product claims anywhere in this creative. */
+  items: [
+    { id: "tops",  label: "Tops",  fill: "teal",   path: "" },
+    { id: "bags",  label: "Bags",  fill: "accent", path: "" },
+    { id: "denim", label: "Denim", fill: "ink",    path: "" },
+    { id: "shoes", label: "Shoes", fill: "hot",    path: "" }
+  ],
+
+  /* Scoring. Reaching targetPoints completes the run early; the 20s cap in
+     `timing` still ends it either way, so the player can never fail out. */
+  scoring: {
+    pointsPerItem: 100,
+    pointsPerHot:  250,              // contested items pay more (live from step 3)
+    targetPoints:  2000,             // active player completes at ~13.5s
+                                     // RE-TUNE in step 3 — hot items add points
+    displayStep:   10                // HUD roll-up granularity
+  },
+
+  timing: {
+    startAutoAdvanceMs: 3000,        // passive viewer still sees the game
+    playDurationMs:    20000,        // hard cap
+    targetCompletionMs:15000,        // difficulty is tuned against this
+    tutorialMs:         2000,        // hand hint, killed on first input
+    completeHoldMs:      600,        // let the winning catch land before the card
+    endIdlePulseMs:     4000,        // pulse once, never auto-redirect
+    transitionMs:        260
+  },
+
+  /* Difficulty curve. Tuned so a passive or clumsy player still finishes with
+     a full basket — losing is honest but it makes a bad ad. Consumed step 2. */
+  difficulty: {
+    lanes: 3,
+    spawnMsStart: 900, spawnMsEnd: 480,
+    fallSpeedStart: 340, fallSpeedEnd: 620,   // logical units / second
+
+    /* Per-item speed. The curve above sets the baseline for the moment an item
+       spawns; each item then picks a tier, so the field reads as a mix rather
+       than a uniform sheet. Weights are relative and need not sum to 1.
+       Step 4 gives the fast tier a motion treatment so speed is readable. */
+    speedTiers: [
+      { weight: 55, mul: 0.92 },              // drifts down
+      { weight: 30, mul: 1.18 },              // brisk
+      { weight: 15, mul: 1.48 }               // drops
+    ],
+
+    basketSpeed: 2400,                        // tap-to-move glide
+    catchPadding: 44,                         // forgiving hitbox, logical units
+    hotChance: 0.25,                          // roughly 1 in 4
+    hotTimerMs: 1600,                         // ring drains, then the rival takes it
+    assistBelow: 3,                           // widen catch window if behind pace
+    attractSlowMo: 0.32,                      // START: mechanic legible, not busy
+
+    /* Field geometry, in logical units. Lives in config because a re-skin with
+       a different vessel (tote, crate, hanger rail) needs different numbers. */
+    field: {
+      inset:        90,     // lane band inset from the stage edges
+      itemSize:    108,
+      basketW:     190,
+      basketH:     104,
+      basketBottom:1160,    // leaves the home indicator clear
+      dragZoneTop:  853,    // lower third; drags below this track 1:1
+      catchDepth:   90      // how far past the rim an item can still be caught
+    }
+  },
+
+  cta: {
+    // Verified store listings. Empty string anywhere here = that route no-ops.
+    urls: {
+      ios:      "https://apps.apple.com/us/app/vinted-pre-loved-marketplace/id632064380",
+      android:  "https://play.google.com/store/apps/details?id=fr.vinted",
+      fallback: "https://www.vinted.com/app"
+    },
+    deepLinkParam: "category"        // "" disables the deep link entirely
+  },
+
+  fx: {
+    maxParticles: 60,                // hard cap, pooled
+    shake: true                      // auto-disabled under reduced motion
+  },
+
+  stage: { w: 720, h: 1280, maxDpr: 2 }   // logical resolution
+};
+
+/* ===========================================================================
+   2. SDK — unified network wrapper.
+   SDK.ready() once on init, SDK.cta(url) on any CTA tap. Detects the host and
+   routes to its call; falls back to window.open standalone.
+   =========================================================================== */
+const SDK = (function () {
+  let network = "standalone";
+  let readySent = false;
+  let lastCta = 0;
+
+  function has(fn) { return typeof fn === "function"; }
+
+  function parentMraid() {
+    try { return window.parent && window.parent !== window ? window.parent.mraid : null; }
+    catch (e) { return null; }       // cross-origin parent
+  }
+
+  function mraidObj() { return window.mraid || parentMraid() || null; }
+
+  function detect() {
+    const w = window;
+    if (w.dapi) return "ironsource";                              // ironSource DAPI
+    if (w.FbPlayableAd) return "meta";                            // Meta / Audience Network
+    if (has(w.openAppStore)) return "tiktok";                     // TikTok / Pangle
+    if (has(w.install) && has(w.gameReady)) return "mintegral";   // Mintegral
+    if (w.playableSDKAPI) return "unity";                         // Unity Ads
+    if (mraidObj()) return "mraid";                               // MRAID, incl. AppLovin
+    return "standalone";
+  }
+
+  function ready() {
+    if (readySent) return;
+    readySent = true;
+    network = detect();
+
+    try {
+      switch (network) {
+        case "mraid": {
+          const m = mraidObj();
+          if (has(m.getState) && m.getState() === "loading" && has(m.addEventListener)) {
+            m.addEventListener("ready", function onReady() {
+              if (has(m.removeEventListener)) m.removeEventListener("ready", onReady);
+            });
+          }
+          break;
+        }
+        case "ironsource": {
+          const d = window.dapi;
+          if (has(d.isReady) && !d.isReady() && has(d.addEventListener)) {
+            d.addEventListener("ready", function () {});
+          }
+          break;
+        }
+        case "mintegral":
+          window.gameReady();
+          break;
+      }
+      // AppLovin start hook, present regardless of the branch above.
+      if (has(window.al_onPlayableStart)) window.al_onPlayableStart();
+    } catch (e) { /* never let a host SDK take the creative down */ }
+
+    return network;
+  }
+
+  function cta(url) {
+    const now = Date.now();
+    if (now - lastCta < 800) return;   // one tap must not open two stores
+    lastCta = now;
+
+    try {
+      switch (network) {
+        case "mraid": {
+          const m = mraidObj();
+          if (has(m.open) && url) { m.open(url); return; }
+          break;
+        }
+        case "meta":
+          window.FbPlayableAd.onCTAClick();
+          return;
+        case "tiktok":
+          window.openAppStore();
+          return;
+        case "ironsource": {
+          const d = window.dapi;
+          if (has(d.openStoreUrl)) { d.openStoreUrl(); return; }
+          if (has(d.openStore))    { d.openStore(); return; }
+          break;
+        }
+        case "unity": {
+          const p = window.playableSDKAPI;
+          if (has(p.openStore)) { p.openStore(); return; }
+          const m = mraidObj();
+          if (m && has(m.open) && url) { m.open(url); return; }
+          break;
+        }
+        case "mintegral":
+          window.install();
+          return;
+      }
+    } catch (e) { /* fall through to the browser route */ }
+
+    // Standalone, or a host call that wasn't available. No destination
+    // configured means genuinely nothing happens.
+    if (url) window.open(url, "_blank");
+  }
+
+  return { ready, cta, get network() { return network; } };
+})();
+
+/* ===========================================================================
+   3. Stage — fixed logical resolution, letterboxed, DPR-capped.
+   =========================================================================== */
+const STAGE = CONFIG.stage;
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d", { alpha: true });
+
+const view = { w: 0, h: 0, scale: 1, dpr: 1 };
+
+function layout() {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const ratio = STAGE.w / STAGE.h;
+
+  // Contain the 9:16 stage inside the viewport. Landscape pillarboxes.
+  let w = vw, h = Math.round(vw / ratio);
+  if (h > vh) { h = vh; w = Math.round(vh * ratio); }
+
+  view.w = w; view.h = h;
+  view.scale = w / STAGE.w;
+  view.dpr = Math.min(window.devicePixelRatio || 1, STAGE.maxDpr);
+
+  document.documentElement.style.setProperty("--stage-w", w + "px");
+  document.documentElement.style.setProperty("--stage-h", h + "px");
+
+  canvas.width  = Math.round(w * view.dpr);
+  canvas.height = Math.round(h * view.dpr);
+  // One transform, set once per resize: canvas code works in logical units.
+  ctx.setTransform(view.scale * view.dpr, 0, 0, view.scale * view.dpr, 0, 0);
+}
+
+/* ===========================================================================
+   4. Boot — palette + copy injection.
+   =========================================================================== */
+const CSS_VAR = { teal: "--teal", tealDeep: "--teal-deep", ink: "--ink",
+                  canvas: "--canvas", hot: "--hot", accent: "--accent" };
+
+function applySkin() {
+  const root = document.documentElement;
+  for (const key in CONFIG.palette) {
+    if (CSS_VAR[key]) root.style.setProperty(CSS_VAR[key], CONFIG.palette[key]);
+  }
+  root.style.setProperty("--xfade", CONFIG.timing.transitionMs + "ms");
+
+  const nodes = document.querySelectorAll("[data-copy]");
+  for (let i = 0; i < nodes.length; i++) {
+    const key = nodes[i].getAttribute("data-copy");
+    if (key in CONFIG.copy) nodes[i].textContent = CONFIG.copy[key];
+  }
+  document.title = CONFIG.copy.startHeadline;
+}
+
+const reducedMotion =
+  window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* ===========================================================================
+   5. State machine — START -> PLAY -> END. One way, no back navigation.
+   =========================================================================== */
+const STATE = { START: "START", PLAY: "PLAY", END: "END" };
+const ORDER = [STATE.START, STATE.PLAY, STATE.END];
+
+const game = {
+  state: STATE.START,
+  stateTime: 0,          // ms in the current state
+  caught: 0,             // items in the basket, drives the end-card haul
+  score: 0,              // points
+  shownScore: 0,         // eased value behind the HUD count-up
+  completing: false,     // target reached; holding before the card
+  completeT: 0,
+  completedEarly: false, // true = hit the goal, false = ran out the clock
+  byCategory: Object.create(null),   // step 5 deep link
+  tutorialDone: false,
+  endPulsed: false
+};
+
+const screens = {
+  START: document.getElementById("screen-start"),
+  PLAY:  document.getElementById("screen-play"),
+  END:   document.getElementById("screen-end")
+};
+
+const timerFill  = document.getElementById("timer-fill");
+const goalFill   = document.getElementById("goal-fill");
+const scoreValue = document.getElementById("score-value");
+const goalTarget = document.getElementById("goal-target");
+const ctaPrimary = document.getElementById("cta-primary");
+
+function setState(next) {
+  if (next === game.state) return;
+  if (ORDER.indexOf(next) <= ORDER.indexOf(game.state)) return;  // one-way guard
+
+  game.state = next;
+  game.stateTime = 0;
+
+  for (const key in screens) {
+    const active = key === next;
+    screens[key].classList.toggle("is-active", active);
+    screens[key].setAttribute("aria-hidden", active ? "false" : "true");
+  }
+
+  if (next === STATE.PLAY) enterPlay();
+  if (next === STATE.END) enterEnd();
+}
+
+function enterPlay() {
+  game.caught = 0;
+  game.score = 0;
+  game.shownScore = 0;
+  game.completing = false;
+  game.completedEarly = false;
+  game.completeT = 0;
+  game.byCategory = Object.create(null);
+  resetHud();
+}
+
+function enterEnd() {
+  game.endPulsed = false;
+  ctaPrimary.classList.remove("pulse");
+}
+
+/* ===========================================================================
+   6. CTA — deep link assembly + fire.
+   Everything resolves inside the creative; no network calls are made here.
+   =========================================================================== */
+function topCategory() {
+  let best = null, bestN = 0;
+  for (const id in game.byCategory) {
+    if (game.byCategory[id] > bestN) { bestN = game.byCategory[id]; best = id; }
+  }
+  return best;
+}
+
+function storeUrl() {
+  const u = CONFIG.cta.urls || {};
+  const ua = navigator.userAgent || "";
+  const isIOS = /iPad|iPhone|iPod/.test(ua) ||
+                (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const isAndroid = /Android/.test(ua);
+  return (isIOS ? u.ios : isAndroid ? u.android : "") || u.fallback || "";
+}
+
+function ctaUrl() {
+  const base = storeUrl();
+  if (!base) return "";                                  // nothing configured: no-op
+  const param = CONFIG.cta.deepLinkParam;
+  const cat = topCategory();
+  if (!param || !cat) return base;
+  return base + (base.indexOf("?") === -1 ? "?" : "&") +
+         encodeURIComponent(param) + "=" + encodeURIComponent(cat);
+}
+
+function fireCta() {
+  const url = ctaUrl();
+  if (CONFIG.debug) console.log("[M002] CTA", SDK.network, url || "(no destination)");
+  SDK.cta(url);
+}
+
+/* ===========================================================================
+   6b. Play field — geometry, pools, and the catch loop.
+   Nothing in here allocates once init() has run: items and pops are fixed-size
+   pools, and every per-frame value is written into an existing object.
+   =========================================================================== */
+const DIFF  = CONFIG.difficulty;
+const SCORE = CONFIG.scoring;
+const FIELD = DIFF.field;
+const PAL   = CONFIG.palette;
+
+const FIELD_W = STAGE.w - FIELD.inset * 2;
+const LANE_W  = FIELD_W / DIFF.lanes;
+const BASKET_TOP = FIELD.basketBottom - FIELD.basketH;
+const CATCH_Y    = BASKET_TOP + 26;                  // the rim line
+
+function laneX(i) { return FIELD.inset + LANE_W * (i + 0.5); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+const basket = {
+  x: STAGE.w / 2,
+  targetX: STAGE.w / 2,
+  minX: FIELD.basketW / 2 + 20,
+  maxX: STAGE.w - FIELD.basketW / 2 - 20,
+  squash: 0
+};
+
+/* --- Item pool ----------------------------------------------------------- */
+const ITEM_POOL = 20;
+const items = new Array(ITEM_POOL);
+for (let i = 0; i < ITEM_POOL; i++) {
+  items[i] = { active: false, x: 0, y: 0, vy: 0, cat: 0, rot: 0, spin: 0,
+               tier: 0, hot: false, flying: false, ft: 0, fx0: 0, fy0: 0 };
+}
+
+/* Cumulative tier weights, computed once so spawning never allocates. */
+const TIERS = DIFF.speedTiers;
+const TIER_CUM = new Float64Array(TIERS.length);
+(function () {
+  let sum = 0;
+  for (let i = 0; i < TIERS.length; i++) sum += TIERS[i].weight;
+  let acc = 0;
+  for (let i = 0; i < TIERS.length; i++) { acc += TIERS[i].weight / sum; TIER_CUM[i] = acc; }
+})();
+
+function pickTier() {
+  const r = Math.random();
+  for (let i = 0; i < TIER_CUM.length - 1; i++) if (r <= TIER_CUM[i]) return i;
+  return TIER_CUM.length - 1;
+}
+
+let spawnTimer = 0;
+let lastLane = -1;
+
+function spawnItem(lane, cat, y) {
+  for (let i = 0; i < ITEM_POOL; i++) {
+    const it = items[i];
+    if (it.active) continue;
+    it.active = true; it.flying = false; it.ft = 0;
+    it.hot = false;                  // step 3 decides this
+    it.x = laneX(lane);
+    it.y = y;
+    it.tier = pickTier();
+    it.vy = fallSpeed() * TIERS[it.tier].mul;
+    it.cat = cat;
+    it.rot = (Math.random() - .5) * .45;
+    it.spin = (Math.random() - .5) * .55 * TIERS[it.tier].mul;
+    return it;
+  }
+  return null;                       // pool exhausted: skip, never allocate
+}
+
+/* --- Difficulty curve ----------------------------------------------------- */
+function progress() {
+  if (game.state !== STATE.PLAY) return 0;
+  const t = game.stateTime / CONFIG.timing.playDurationMs;
+  return t < 0 ? 0 : t > 1 ? 1 : t;
+}
+function fallSpeed() { return lerp(DIFF.fallSpeedStart, DIFF.fallSpeedEnd, progress()); }
+function spawnGap()  { return lerp(DIFF.spawnMsStart,   DIFF.spawnMsEnd,   progress()); }
+
+function updateSpawn(dt) {
+  spawnTimer += dt;
+  const gap = spawnGap();
+  if (spawnTimer < gap) return;
+  spawnTimer -= gap;
+
+  let lane = (Math.random() * DIFF.lanes) | 0;
+  if (lane === lastLane) {                                  // avoid a lane repeat
+    lane = (lane + 1 + ((Math.random() * (DIFF.lanes - 1)) | 0)) % DIFF.lanes;
+  }
+  lastLane = lane;
+  spawnItem(lane, (Math.random() * CONFIG.items.length) | 0, -FIELD.itemSize);
+}
+
+/* --- Catch --------------------------------------------------------------- */
+function catchItem(it) {
+  it.flying = true; it.ft = 0; it.fx0 = it.x; it.fy0 = it.y;
+
+  game.caught++;
+  game.score += it.hot ? SCORE.pointsPerHot : SCORE.pointsPerItem;
+  const id = CONFIG.items[it.cat].id;
+  game.byCategory[id] = (game.byCategory[id] || 0) + 1;   // feeds the deep link
+
+  basket.squash = 1;
+  popLabel(CONFIG.items[it.cat].label);
+  hudDirty = true;
+}
+
+function updateItems(dt, live) {
+  const s = dt / 1000;
+  const reach = FIELD.basketW * .5 + DIFF.catchPadding;
+
+  for (let i = 0; i < ITEM_POOL; i++) {
+    const it = items[i];
+    if (!it.active) continue;
+
+    if (it.flying) {                                  // caught: fly into the basket
+      it.ft += dt;
+      const t = it.ft / 180;
+      if (t >= 1) { it.active = false; continue; }
+      const e = t * t * (3 - 2 * t);                  // smoothstep
+      it.x = lerp(it.fx0, basket.x, e);
+      it.y = lerp(it.fy0, BASKET_TOP + 30, e);
+      it.rot += it.spin * s;
+      continue;
+    }
+
+    it.y += it.vy * s;
+    it.rot += it.spin * s;
+
+    if (live && it.y >= CATCH_Y - FIELD.itemSize * .5 &&
+                it.y <= CATCH_Y + FIELD.catchDepth &&
+                Math.abs(it.x - basket.x) <= reach) {
+      catchItem(it);
+      continue;
+    }
+
+    if (it.y > STAGE.h + FIELD.itemSize) it.active = false;   // missed: no penalty
+  }
+}
+
+function updateBasket(dt) {
+  const dx = basket.targetX - basket.x;
+  const step = DIFF.basketSpeed * dt / 1000;
+  basket.x += dx > step ? step : dx < -step ? -step : dx;
+  if (basket.x < basket.minX) basket.x = basket.minX;
+  if (basket.x > basket.maxX) basket.x = basket.maxX;
+
+  if (basket.squash > 0) {
+    basket.squash -= dt / 260;
+    if (basket.squash < 0) basket.squash = 0;
+  }
+}
+
+/* --- Catch labels (category names only; this creative shows no prices) ----- */
+const POP_POOL = 6;
+const POP_LIFE = 700;
+const pops = new Array(POP_POOL);
+for (let i = 0; i < POP_POOL; i++) pops[i] = { active: false, t: 0, x: 0, text: "" };
+
+function popLabel(text) {
+  for (let i = 0; i < POP_POOL; i++) {
+    const q = pops[i];
+    if (q.active) continue;
+    q.active = true; q.t = 0; q.x = basket.x; q.text = text;
+    return;
+  }
+}
+
+function updatePops(dt) {
+  for (let i = 0; i < POP_POOL; i++) {
+    const q = pops[i];
+    if (!q.active) continue;
+    q.t += dt;
+    if (q.t >= POP_LIFE) q.active = false;
+  }
+}
+
+/* --- Attract seed: START must already show the mechanic ------------------- */
+function seedAttract() {
+  const ys = [-60, 260, 620, 900];
+  for (let i = 0; i < ys.length; i++) {
+    spawnItem(i % DIFF.lanes, (Math.random() * CONFIG.items.length) | 0, ys[i]);
+  }
+}
+
+/* ===========================================================================
+   6c. Drawing — placeholder primitives. Step 4 replaces the two draw
+   functions below with the real drawn shapes; nothing else changes.
+   =========================================================================== */
+function rrect(x, y, w, h, r) {          // arcTo, not roundRect: older WebViews
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawItem(it) {
+  const size = FIELD.itemSize;
+  ctx.save();
+  ctx.translate(it.x, it.y);
+  ctx.rotate(it.rot);
+  ctx.fillStyle = PAL[CONFIG.items[it.cat].fill];
+  rrect(-size / 2, -size / 2, size, size, 24);
+  ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,.32)";           // placeholder detail
+  rrect(-size / 2 + 20, -size / 2 + 20, size - 40, (size - 40) * .40, 10);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawBasket() {
+  const sq = basket.squash;
+  const w = FIELD.basketW * (1 + sq * .07);
+  const h = FIELD.basketH * (1 - sq * .11);
+  const x = basket.x - w / 2;
+  const y = FIELD.basketBottom - h;
+
+  ctx.fillStyle = PAL.tealDeep;
+  rrect(x, y + 16, w, h - 16, 26);
+  ctx.fill();
+  ctx.fillStyle = PAL.teal;
+  rrect(x, y, w, 32, 16);
+  ctx.fill();
+}
+
+function drawPops() {
+  ctx.textAlign = "center";
+  ctx.font = "700 30px " + POP_FONT;
+  for (let i = 0; i < POP_POOL; i++) {
+    const q = pops[i];
+    if (!q.active) continue;
+    const t = q.t / POP_LIFE;
+    ctx.globalAlpha = t < .15 ? t / .15 : 1 - (t - .15) / .85;
+    ctx.fillStyle = PAL.ink;
+    ctx.fillText(q.text, q.x, BASKET_TOP - 18 - t * 72);
+  }
+  ctx.globalAlpha = 1;
+}
+const POP_FONT = 'ui-rounded, "SF Pro Rounded", -apple-system, system-ui, sans-serif';
+
+/* ===========================================================================
+   7. Input — one pointer path for every state.
+   =========================================================================== */
+const pointer = { down: false, x: 0, y: 0 };
+
+function stagePoint(e) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: (e.clientX - r.left) / view.scale,          // logical units
+    y: (e.clientY - r.top)  / view.scale
+  };
+}
+
+let dragging = false;
+
+function onDown(e) {
+  const p = stagePoint(e);
+  pointer.down = true; pointer.x = p.x; pointer.y = p.y;
+  game.tutorialDone = true;
+
+  if (game.state === STATE.START) { setState(STATE.PLAY); return; }
+  if (game.state === STATE.END)   { fireCta(); return; }   // tap anywhere on the card
+
+  // Two input models, one path. A press in the lower third starts a 1:1 drag;
+  // a press anywhere else is tap-to-move and the basket glides to it.
+  dragging = p.y >= FIELD.dragZoneTop;
+  basket.targetX = p.x;
+}
+
+function onMove(e) {
+  if (!pointer.down) return;
+  const p = stagePoint(e);
+  pointer.x = p.x; pointer.y = p.y;
+  if (game.state === STATE.START) { setState(STATE.PLAY); return; }  // a drag counts as input
+  if (game.state !== STATE.PLAY) return;
+  if (!dragging && p.y >= FIELD.dragZoneTop) dragging = true;        // finger arrives in the zone
+  if (dragging) basket.targetX = p.x;
+}
+
+function onUp() { pointer.down = false; dragging = false; }
+
+const stage = document.getElementById("stage");
+stage.addEventListener("pointerdown", onDown, { passive: true });
+stage.addEventListener("pointermove", onMove, { passive: true });
+window.addEventListener("pointerup", onUp, { passive: true });
+window.addEventListener("pointercancel", onUp, { passive: true });
+
+// The two buttons fire the CTA directly and must not also reach the stage.
+document.getElementById("cta-chip").addEventListener("click", function (e) {
+  e.stopPropagation(); fireCta();
+});
+ctaPrimary.addEventListener("click", function (e) {
+  e.stopPropagation(); fireCta();
+});
+
+window.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+
+/* ===========================================================================
+   8. Loop — one rAF, dt-driven. Nothing is allocated in here.
+   =========================================================================== */
+let lastT = 0;
+
+function frame(t) {
+  requestAnimationFrame(frame);
+
+  if (!lastT) lastT = t;
+  let dt = t - lastT;
+  lastT = t;
+  if (dt > 100) dt = 100;            // backgrounded tab / stall clamp
+
+  game.stateTime += dt;
+  update(dt);
+  render();
+}
+
+function update(dt) {
+  switch (game.state) {
+    case STATE.START:
+      // The mechanic runs in slow motion behind the veil. No catching yet.
+      updateSpawn(dt);
+      updateItems(dt * DIFF.attractSlowMo, false);
+      if (game.stateTime >= CONFIG.timing.startAutoAdvanceMs) setState(STATE.PLAY);
+      break;
+
+    case STATE.PLAY: {
+      updateSpawn(dt);
+      updateBasket(dt);
+      updateItems(dt, !game.completing);   // stop scoring once the goal is met
+      updatePops(dt);
+      updateHud(dt);
+
+      const left = 1 - game.stateTime / CONFIG.timing.playDurationMs;
+      timerFill.style.transform = "scaleX(" + (left > 0 ? left : 0) + ")";
+
+      // Two ways out, and neither is a loss: hit the goal, or run the clock.
+      if (!game.completing && game.score >= SCORE.targetPoints) {
+        game.completing = true;
+        game.completedEarly = true;
+        game.completeT = 0;
+      }
+      if (game.completing) {
+        game.completeT += dt;
+        if (game.completeT >= CONFIG.timing.completeHoldMs) setState(STATE.END);
+      } else if (game.stateTime >= CONFIG.timing.playDurationMs) {
+        setState(STATE.END);
+      }
+      break;
+    }
+
+    case STATE.END:
+      // Pulse once, then leave the player alone. Never auto-redirect.
+      if (!game.endPulsed && game.stateTime >= CONFIG.timing.endIdlePulseMs) {
+        game.endPulsed = true;
+        if (!reducedMotion) ctaPrimary.classList.add("pulse");
+      }
+      break;
+  }
+}
+
+function render() {
+  ctx.clearRect(0, 0, STAGE.w, STAGE.h);
+  if (game.state === STATE.END) return;              // the card covers the field
+
+  // Lane guides. Step 4 replaces these with the real background treatment.
+  ctx.strokeStyle = "rgba(22,17,14,.06)";
+  ctx.lineWidth = 2;
+  for (let i = 1; i < DIFF.lanes; i++) {
+    const x = Math.round(FIELD.inset + LANE_W * i) + .5;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, FIELD.basketBottom);
+    ctx.stroke();
+  }
+
+  // Items first, basket over them: a caught item slides in behind the rim.
+  for (let i = 0; i < ITEM_POOL; i++) {
+    if (items[i].active) drawItem(items[i]);
+  }
+  drawBasket();
+  drawPops();
+}
+
+/* HUD. The score eases toward its real value so an award reads as a count-up,
+   and the DOM is only written when the rounded, stepped value actually moves. */
+let hudDirty = false;
+let hudShown = -1;
+let goalShown = -1;
+
+function group(n) {                  // 1250 -> "1,250"
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+function updateHud(dt) {
+  // Count-up: close 12% of the remaining gap per 16ms frame.
+  if (game.shownScore !== game.score) {
+    const k = 1 - Math.pow(0.88, dt / 16.667);
+    game.shownScore += (game.score - game.shownScore) * k;
+    if (Math.abs(game.score - game.shownScore) < SCORE.displayStep) {
+      game.shownScore = game.score;
+    }
+  }
+
+  const shown = Math.round(game.shownScore / SCORE.displayStep) * SCORE.displayStep;
+  if (shown !== hudShown) {
+    hudShown = shown;
+    scoreValue.textContent = group(shown);
+  }
+
+  const g = SCORE.targetPoints > 0 ? game.score / SCORE.targetPoints : 0;
+  const gc = g > 1 ? 1 : g;
+  if (Math.abs(gc - goalShown) > 0.004) {
+    goalShown = gc;
+    goalFill.style.transform = "scaleX(" + gc + ")";
+  }
+
+  if (hudDirty) {                    // a catch just landed: pop the number
+    hudDirty = false;
+    if (!reducedMotion) {
+      scoreValue.classList.remove("bump");
+      void scoreValue.offsetWidth;                    // restart the animation
+      scoreValue.classList.add("bump");
+    }
+  }
+}
+
+function resetHud() {
+  hudShown = -1; goalShown = -1;
+  goalTarget.textContent = group(SCORE.targetPoints);
+  scoreValue.textContent = "0";
+  goalFill.style.transform = "scaleX(0)";
+}
+
+/* ===========================================================================
+   9. Init
+   =========================================================================== */
+function init() {
+  applySkin();
+  layout();
+  seedAttract();
+  setScreenImmediate(STATE.START);
+
+  SDK.ready();                       // sets SDK.network
+
+  const dbg = document.getElementById("debug");
+  if (CONFIG.debug) {
+    dbg.textContent =
+      "M002 step 2c · " + STAGE.w + "x" + STAGE.h + " · dpr " + view.dpr +
+      " · " + SDK.network + (reducedMotion ? " · reduced-motion" : "");
+  } else {
+    dbg.remove();
+  }
+
+  requestAnimationFrame(frame);
+}
+
+function setScreenImmediate(key) {
+  game.state = key;
+  game.stateTime = 0;
+  for (const k in screens) {
+    const active = k === key;
+    screens[k].classList.toggle("is-active", active);
+    screens[k].setAttribute("aria-hidden", active ? "false" : "true");
+  }
+}
+
+window.addEventListener("resize", layout);
+window.addEventListener("orientationchange", layout);
+if (window.visualViewport) window.visualViewport.addEventListener("resize", layout);
+
+init();
+</script>
+</body>
+</html>
